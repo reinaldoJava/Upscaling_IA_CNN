@@ -1,0 +1,153 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, Dataset
+from torchvision.transforms import Compose, ToTensor, Resize, Normalize
+import os
+import time
+import traceback
+import glob
+from PIL import Image
+
+# ================================
+#       MODELO ESRGAN ADVERSARIAL
+# ================================
+class ResidualBlock(nn.Module):
+    def __init__(self, channels):
+        super(ResidualBlock, self).__init__()
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1)
+
+    def forward(self, x):
+        return x + self.conv2(self.relu(self.conv1(x)))
+
+class ESRGAN(nn.Module):
+    def __init__(self):
+        super(ESRGAN, self).__init__()
+        self.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1)
+        self.relu = nn.ReLU(inplace=True)
+        self.res_blocks = nn.Sequential(*[ResidualBlock(64) for _ in range(8)])  # Mais blocos para maior qualidade
+        self.conv2 = nn.Conv2d(64, 3, kernel_size=3, stride=1, padding=1)
+
+    def forward(self, x):
+        return self.conv2(self.res_blocks(self.relu(self.conv1(x))))
+
+class Discriminator(nn.Module):
+    def __init__(self):
+        super(Discriminator, self).__init__()
+        self.model = nn.Sequential(
+            nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(128),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(256),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(256, 512, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(512),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(512, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        return self.model(x)
+
+# ================================
+#       CONFIGURAÇÕES
+# ================================
+image_folder = '/mnt/d/Desenv/Python/frames/Dream/Data/Videos/Train/video_2/class1/'
+model_save_path = '/mnt/d/Desenv/Python/frames/Dream/models/esrgan_adversarial.pth'
+
+batch_size = 16
+num_epochs = 50
+learning_rate = 5e-5
+
+# Dispositivo
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Usando dispositivo: {device}")
+
+# Transformação
+transform = Compose([
+    Resize((640, 480)),
+    ToTensor(),
+    Normalize((0.5,), (0.5,))
+])
+
+# ================================
+#       INICIALIZAÇÃO DOS MODELOS
+# ================================
+generator = ESRGAN().to(device)
+discriminator = Discriminator().to(device)
+
+# Otimizadores e perda
+criterion = nn.BCEWithLogitsLoss()
+mse_loss = nn.MSELoss()
+optimizer_G = optim.Adam(generator.parameters(), lr=learning_rate, betas=(0.5, 0.999))
+optimizer_D = optim.Adam(discriminator.parameters(), lr=learning_rate, betas=(0.5, 0.999))
+
+# ================================
+#       CARREGAR DATASET
+# ================================
+class ImageDataset(Dataset):
+    def __init__(self, root_dir, transform=None):
+        self.image_list = sorted(glob.glob(os.path.join(root_dir, "*.png")))[::5]  # Pula 5 frames
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.image_list)
+
+    def __getitem__(self, idx):
+        img = Image.open(self.image_list[idx]).convert("RGB")
+        img = self.transform(img) if self.transform else img
+        return img, torch.tensor(1)
+
+dataset = ImageDataset(image_folder, transform=transform)
+dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=8, pin_memory=False, persistent_workers=True)
+
+# ================================
+#       TREINAMENTO
+# ================================
+print(f"Total de imagens disponíveis: {len(dataset)}")
+start_time = time.time()
+scaler = torch.cuda.amp.GradScaler()
+
+generator.train()
+discriminator.train()
+
+for epoch in range(num_epochs):
+    for i, (inputs, _) in enumerate(dataloader):
+        inputs = inputs.to(device, non_blocking=True)
+        real_labels = torch.ones((inputs.size(0), 1), dtype=torch.float32).to(device)
+        fake_labels = torch.zeros((inputs.size(0), 1), dtype=torch.float32).to(device)
+
+        # Treina o gerador (ESRGAN)
+        optimizer_G.zero_grad()
+        with torch.cuda.amp.autocast():
+            outputs = generator(inputs)
+            g_loss = mse_loss(outputs, inputs) + criterion(discriminator(outputs), real_labels)
+        scaler.scale(g_loss).backward()
+        scaler.step(optimizer_G)
+        scaler.update()
+
+        # Treina o discriminador
+        optimizer_D.zero_grad()
+        with torch.cuda.amp.autocast():
+            real_loss = criterion(discriminator(inputs), real_labels)
+            fake_loss = criterion(discriminator(outputs.detach()), fake_labels)
+            d_loss = (real_loss + fake_loss) / 2
+        scaler.scale(d_loss).backward()
+        scaler.step(optimizer_D)
+        scaler.update()
+
+        # Log de progresso
+        print(f"Epoch [{epoch+1}/{num_epochs}], Step [{i+1}/{len(dataloader)}], Loss G: {g_loss.item():.6f}, Loss D: {d_loss.item():.6f}")
+    
+    torch.save(generator.state_dict(), model_save_path)
+    print(f"Modelo salvo após época {epoch+1}.")
+
+print(f"Treinamento concluído! Tempo total: {time.time() - start_time:.2f}s")
